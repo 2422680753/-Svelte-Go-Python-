@@ -45,6 +45,15 @@ export const taskAPI = {
   assignTask: (id, data) => api.post(`/tasks/${id}/assign`, data),
   getMyPending: () => api.get('/tasks/my-pending'),
   getMyHistory: (params) => api.get('/tasks/my-history', { params }),
+  getInconsistentTasks: () => api.get('/tasks/inconsistent'),
+  getTaskSnapshots: (id, params) => api.get(`/tasks/${id}/snapshots`, { params }),
+  checkConsistency: (id) => api.get(`/tasks/${id}/consistency`),
+  rollbackTask: (id, data) => api.post(`/tasks/${id}/rollback`, data),
+  getFrameMapping: (id) => api.get(`/tasks/${id}/frame-mapping`),
+  getFrames: (id, params) => api.get(`/tasks/${id}/frames`, { params }),
+  getFramesByTime: (id, params) => api.get(`/tasks/${id}/frames-by-time`, { params }),
+  getFlaggedFrames: (id) => api.get(`/tasks/${id}/flagged-frames`),
+  getFrameProgress: (id) => api.get(`/tasks/${id}/frame-progress`),
 }
 
 export const batchAPI = {
