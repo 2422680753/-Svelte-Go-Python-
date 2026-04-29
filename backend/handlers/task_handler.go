@@ -4,6 +4,7 @@ import (
 	"content-moderation/config"
 	"content-moderation/models"
 	"content-moderation/services"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -14,24 +15,38 @@ import (
 )
 
 type TaskHandler struct {
-	db                    *gorm.DB
-	redis                 *redis.Client
-	config                *config.Config
-	stateMachine          *models.StateMachine
-	taskDistributor       *services.TaskDistributor
-	humanModerationService *services.HumanModerationService
-	batchService          *services.BatchService
+	db                      *gorm.DB
+	redis                   *redis.Client
+	config                  *config.Config
+	stateMachine            *models.StateMachine
+	txManager               *models.StateTransactionManager
+	recoveryService         *services.StateRecoveryService
+	taskDistributor         *services.TaskDistributor
+	humanModerationService  *services.HumanModerationService
+	humanModerationServiceV2 *services.HumanModerationServiceV2
+	batchService            *services.BatchService
 }
 
-func NewTaskHandler(db *gorm.DB, redis *redis.Client, cfg *config.Config, sm *models.StateMachine) *TaskHandler {
+func NewTaskHandler(
+	db *gorm.DB, 
+	redis *redis.Client, 
+	cfg *config.Config, 
+	sm *models.StateMachine,
+) *TaskHandler {
+	txManager := models.NewStateTransactionManager(db, redis)
+	recoveryService := services.NewStateRecoveryService(db, redis, cfg, txManager)
+	
 	return &TaskHandler{
-		db:                    db,
-		redis:                 redis,
-		config:                cfg,
-		stateMachine:          sm,
-		taskDistributor:       services.NewTaskDistributor(db, redis, cfg, sm),
-		humanModerationService: services.NewHumanModerationService(db, redis, cfg, sm),
-		batchService:          services.NewBatchService(db, redis, cfg, sm),
+		db:                      db,
+		redis:                   redis,
+		config:                  cfg,
+		stateMachine:            sm,
+		txManager:               txManager,
+		recoveryService:         recoveryService,
+		taskDistributor:         services.NewTaskDistributor(db, redis, cfg, sm),
+		humanModerationService:  services.NewHumanModerationService(db, redis, cfg, sm),
+		humanModerationServiceV2: services.NewHumanModerationServiceV2(db, redis, cfg, sm, txManager),
+		batchService:            services.NewBatchService(db, redis, cfg, sm),
 	}
 }
 
@@ -133,10 +148,10 @@ func (h *TaskHandler) GetTasks(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"tasks":      tasks,
-		"total":      total,
-		"page":       page,
-		"page_size":  pageSize,
+		"tasks":       tasks,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
 		"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
 	})
 }
@@ -186,12 +201,22 @@ func (h *TaskHandler) GetTask(c *gin.Context) {
 		logs = []models.ModerationLog{}
 	}
 
+	snapshotHistory, err := h.txManager.GetSnapshotHistory(c.Request.Context(), taskID, 10)
+	if err != nil {
+		snapshotHistory = []models.StateSnapshot{}
+	}
+
+	canRollback, rollbackReason, _ := h.txManager.CanRollback(c.Request.Context(), taskID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"task":             task,
 		"frames":           frames,
 		"auto_result":      autoResult,
 		"human_result":     humanResult,
 		"moderation_logs":  logs,
+		"snapshot_history": snapshotHistory,
+		"can_rollback":     canRollback,
+		"rollback_reason":  rollbackReason,
 		"frame_status":     frameService.GetFrameExtractionStatus(task.VideoID),
 	})
 }
@@ -375,12 +400,18 @@ func (h *TaskHandler) StartReview(c *gin.Context) {
 		return
 	}
 
-	if err := h.humanModerationService.StartReview(taskID, userID.(uuid.UUID)); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := h.humanModerationServiceV2.StartReview(c.Request.Context(), taskID, userID.(uuid.UUID)); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(),
+			"code":  "START_REVIEW_FAILED",
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Review started"})
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Review started",
+		"task_id": taskID,
+	})
 }
 
 func (h *TaskHandler) SubmitReview(c *gin.Context) {
@@ -391,14 +422,20 @@ func (h *TaskHandler) SubmitReview(c *gin.Context) {
 		return
 	}
 
-	var decision services.ReviewDecision
-	if err := c.ShouldBindJSON(&decision); err != nil {
+	var req struct {
+		Decision       string   `json:"decision" binding:"required"`
+		ViolationTags  []string `json:"violation_tags"`
+		Comment        string   `json:"comment"`
+		ReviewDuration float64  `json:"review_duration"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	if decision.Decision != "approve" && decision.Decision != "reject" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid decision"})
+	if req.Decision != "approve" && req.Decision != "reject" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid decision: must be 'approve' or 'reject'"})
 		return
 	}
 
@@ -408,17 +445,159 @@ func (h *TaskHandler) SubmitReview(c *gin.Context) {
 		return
 	}
 
-	reviewDuration := decision.ReviewDuration
+	reviewDuration := req.ReviewDuration
 	if reviewDuration == 0 {
 		reviewDuration = 60.0
 	}
 
-	if err := h.humanModerationService.SubmitReview(taskID, userID.(uuid.UUID), decision, reviewDuration); err != nil {
+	if err := h.humanModerationServiceV2.SubmitReview(
+		c.Request.Context(),
+		taskID,
+		userID.(uuid.UUID),
+		req.Decision,
+		req.ViolationTags,
+		req.Comment,
+		reviewDuration,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+			"code":  "SUBMIT_REVIEW_FAILED",
+		})
+		return
+	}
+
+	var task models.ModerationTask
+	h.db.Preload("Video").First(&task, taskID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Review submitted successfully",
+		"task_id":  taskID,
+		"status":   task.CurrentStatus,
+		"decision": req.Decision,
+	})
+}
+
+func (h *TaskHandler) RollbackTask(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User not authenticated"})
+		return
+	}
+
+	var req struct {
+		Reason string `json:"reason" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Review submitted"})
+	canRollback, reason, err := h.txManager.CanRollback(c.Request.Context(), taskID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if !canRollback {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":        "Cannot rollback this task",
+			"reason":       reason,
+			"can_rollback": false,
+		})
+		return
+	}
+
+	if err := h.humanModerationServiceV2.RollbackToLatestSnapshot(
+		c.Request.Context(),
+		taskID,
+		userID.(uuid.UUID),
+		req.Reason,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": err.Error(),
+			"code":  "ROLLBACK_FAILED",
+		})
+		return
+	}
+
+	var task models.ModerationTask
+	h.db.First(&task, taskID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Task rolled back successfully",
+		"task_id":  taskID,
+		"status":   task.CurrentStatus,
+		"reason":   req.Reason,
+	})
+}
+
+func (h *TaskHandler) GetTaskSnapshots(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	limit := 20
+	if c.Query("limit") != "" {
+		fmt.Sscanf(c.Query("limit"), "%d", &limit)
+	}
+
+	snapshots, err := h.txManager.GetSnapshotHistory(c.Request.Context(), taskID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"task_id":   taskID,
+		"snapshots": snapshots,
+		"count":     len(snapshots),
+	})
+}
+
+func (h *TaskHandler) CheckTaskConsistency(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	isConsistent, inconsistencies, err := h.txManager.VerifyStateConsistency(c.Request.Context(), taskID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"task_id":           taskID,
+		"is_consistent":     isConsistent,
+		"inconsistencies":   inconsistencies,
+		"checked_at":        time.Now(),
+	})
+}
+
+func (h *TaskHandler) GetInconsistentTasks(c *gin.Context) {
+	checkpoints, err := h.recoveryService.GetInconsistentTasks(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"inconsistent_tasks": checkpoints,
+		"count":               len(checkpoints),
+	})
 }
 
 func (h *TaskHandler) AssignTask(c *gin.Context) {

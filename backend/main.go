@@ -52,6 +52,9 @@ func main() {
 		&models.FrameSegment{},
 		&models.TaskLockRecord{},
 		&models.FrameCache{},
+		&models.StateSnapshot{},
+		&models.CompensationAction{},
+		&models.StateCheckpoint{},
 		&models.Appeal{},
 		&models.ModerationLog{},
 		&models.BatchOperation{},
@@ -97,14 +100,18 @@ func main() {
 				tasks.GET("", taskHandler.GetTasks)
 				tasks.GET("/my-pending", taskHandler.GetMyPendingTasks)
 				tasks.GET("/my-history", taskHandler.GetMyReviewHistory)
+				tasks.GET("/inconsistent", authHandler.RequireRole("admin", "senior_reviewer"), taskHandler.GetInconsistentTasks)
 				tasks.GET("/:id", taskHandler.GetTask)
 				tasks.GET("/:id/frame-mapping", taskHandler.GetFrameMapping)
 				tasks.GET("/:id/frames", taskHandler.GetFramesPaginated)
 				tasks.GET("/:id/frames-by-time", taskHandler.GetFramesByTime)
 				tasks.GET("/:id/flagged-frames", taskHandler.GetFlaggedFrames)
 				tasks.GET("/:id/frame-progress", taskHandler.GetFrameExtractionProgress)
+				tasks.GET("/:id/snapshots", taskHandler.GetTaskSnapshots)
+				tasks.GET("/:id/consistency", taskHandler.CheckTaskConsistency)
 				tasks.POST("/:id/start-review", taskHandler.StartReview)
 				tasks.POST("/:id/submit-review", taskHandler.SubmitReview)
+				tasks.POST("/:id/rollback", authHandler.RequireRole("admin", "senior_reviewer"), taskHandler.RollbackTask)
 				tasks.POST("/:id/assign", authHandler.RequireRole("admin", "senior_reviewer"), taskHandler.AssignTask)
 			}
 
