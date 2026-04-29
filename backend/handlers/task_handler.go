@@ -196,6 +196,171 @@ func (h *TaskHandler) GetTask(c *gin.Context) {
 	})
 }
 
+func (h *TaskHandler) GetFrameMapping(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	var task models.ModerationTask
+	if err := h.db.First(&task, taskID).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get task"})
+		return
+	}
+
+	frameService := services.NewVideoFrameService(h.db, h.redis, h.config)
+	ctx := c.Request.Context()
+	
+	mapping, err := frameService.GetFrameMapping(ctx, taskID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get frame mapping"})
+		return
+	}
+
+	c.JSON(http.StatusOK, mapping)
+}
+
+func (h *TaskHandler) GetFramesPaginated(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	page := 1
+	pageSize := 20
+
+	if c.Query("page") != "" {
+		fmt.Sscanf(c.Query("page"), "%d", &page)
+	}
+	if c.Query("page_size") != "" {
+		fmt.Sscanf(c.Query("page_size"), "%d", &pageSize)
+	}
+
+	frameService := services.NewVideoFrameService(h.db, h.redis, h.config)
+	ctx := c.Request.Context()
+
+	frames, total, err := frameService.GetFramesPaginated(ctx, taskID, page, pageSize)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get frames"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"frames":      frames,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": (total + int64(pageSize) - 1) / int64(pageSize),
+	})
+}
+
+func (h *TaskHandler) GetFramesByTime(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	frameService := services.NewVideoFrameService(h.db, h.redis, h.config)
+	ctx := c.Request.Context()
+
+	timeStr := c.Query("time")
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+
+	if timeStr != "" {
+		var timestamp float64
+		fmt.Sscanf(timeStr, "%f", &timestamp)
+
+		frame, err := frameService.FindFrameByTime(ctx, taskID, timestamp)
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Frame not found"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to find frame"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"frame": frame,
+		})
+		return
+	}
+
+	if startStr != "" && endStr != "" {
+		var startTime, endTime float64
+		fmt.Sscanf(startStr, "%f", &startTime)
+		fmt.Sscanf(endStr, "%f", &endTime)
+
+		frames, err := frameService.GetVideoFramesForTask(ctx, taskID, uuid.Nil)
+		if err != nil {
+			frames = []models.VideoFrame{}
+		}
+
+		var filtered []models.VideoFrame
+		for _, f := range frames {
+			if f.Timestamp >= startTime && f.Timestamp <= endTime {
+				filtered = append(filtered, f)
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"frames": filtered,
+		})
+		return
+	}
+
+	c.JSON(http.StatusBadRequest, gin.H{"error": "Required query params: time OR (start AND end)"})
+}
+
+func (h *TaskHandler) GetFlaggedFrames(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	frameService := services.NewVideoFrameService(h.db, h.redis, h.config)
+	ctx := c.Request.Context()
+
+	frames, err := frameService.GetFlaggedFrames(ctx, taskID)
+	if err != nil {
+		frames = []models.VideoFrame{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"frames": frames,
+	})
+}
+
+func (h *TaskHandler) GetFrameExtractionProgress(c *gin.Context) {
+	taskIDStr := c.Param("id")
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid task ID"})
+		return
+	}
+
+	frameService := services.NewVideoFrameService(h.db, h.redis, h.config)
+	status := frameService.GetFrameExtractionStatusForTask(taskID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"task_id": taskID,
+		"status":  status,
+	})
+}
+
 func (h *TaskHandler) StartReview(c *gin.Context) {
 	taskIDStr := c.Param("id")
 	taskID, err := uuid.Parse(taskIDStr)
