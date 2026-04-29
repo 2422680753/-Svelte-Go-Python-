@@ -49,6 +49,9 @@ func main() {
 		&models.AutoModerationResult{},
 		&models.HumanModerationResult{},
 		&models.VideoFrame{},
+		&models.FrameSegment{},
+		&models.TaskLockRecord{},
+		&models.FrameCache{},
 		&models.Appeal{},
 		&models.ModerationLog{},
 		&models.BatchOperation{},
@@ -65,7 +68,7 @@ func main() {
 		DB:       cfg.Redis.DB,
 	})
 
-	stateMachine := models.NewStateMachine(db, cfg)
+	stateMachine := models.NewStateMachine(db, cfg, redisClient)
 
 	authHandler := handlers.NewAuthHandler(db, cfg)
 	taskHandler := handlers.NewTaskHandler(db, redisClient, cfg, stateMachine)
@@ -95,6 +98,11 @@ func main() {
 				tasks.GET("/my-pending", taskHandler.GetMyPendingTasks)
 				tasks.GET("/my-history", taskHandler.GetMyReviewHistory)
 				tasks.GET("/:id", taskHandler.GetTask)
+				tasks.GET("/:id/frame-mapping", taskHandler.GetFrameMapping)
+				tasks.GET("/:id/frames", taskHandler.GetFramesPaginated)
+				tasks.GET("/:id/frames-by-time", taskHandler.GetFramesByTime)
+				tasks.GET("/:id/flagged-frames", taskHandler.GetFlaggedFrames)
+				tasks.GET("/:id/frame-progress", taskHandler.GetFrameExtractionProgress)
 				tasks.POST("/:id/start-review", taskHandler.StartReview)
 				tasks.POST("/:id/submit-review", taskHandler.SubmitReview)
 				tasks.POST("/:id/assign", authHandler.RequireRole("admin", "senior_reviewer"), taskHandler.AssignTask)
